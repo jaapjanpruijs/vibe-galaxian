@@ -14,10 +14,10 @@ struct PhysicsCategory {
 // MARK: - Enemy Type
 
 enum EnemyType: Int {
-    case drone = 0      // blue, bottom 3 rows
-    case emissary = 1   // purple, row 3
-    case escort = 2     // red, row 4
-    case flagship = 3   // yellow, row 5
+    case drone = 0
+    case emissary = 1
+    case escort = 2
+    case flagship = 3
 
     var pointsInFormation: Int {
         switch self {
@@ -49,6 +49,7 @@ class EnemyNode: SKSpriteNode {
     var isReturning: Bool = false
     var animFrames: [SKTexture] = []
     var hasFiredDuringDive: Int = 0
+    var hasCapturedShip: Bool = false  // for flagships holding a captured player ship
 }
 
 // MARK: - Game Scene
@@ -68,6 +69,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     let gridSpacingX: CGFloat = 38
     let gridSpacingY: CGFloat = 30
     let formationBaseY: CGFloat = 460
+    let dualOffset: CGFloat = 18
 
     // MARK: - Properties
 
@@ -79,6 +81,17 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     let fireCooldownTime: TimeInterval = 0.15
     var isPlayerDead = false
     var respawnTimer: TimeInterval = 0
+
+    // Dual fighter
+    var isDualFighter = false
+    var dualPartner: SKSpriteNode?
+
+    // Tractor beam / capture
+    var capturedShipNode: SKSpriteNode?   // the ship sitting in formation
+    var capturingFlagship: EnemyNode?     // which flagship holds it
+    var isBeingCaptured = false
+    var tractorBeamFlagship: EnemyNode?   // active during beam
+    var tractorBeamNode: SKNode?
 
     // Enemies
     var enemies: [EnemyNode] = []
@@ -95,7 +108,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
 
     // Input
     var keysPressed = Set<UInt16>()
-    var gamepadStickX: CGFloat = 0  // -1 to 1 analog stick
+    var gamepadStickX: CGFloat = 0
 
     // UI
     var scoreLabel: SKLabelNode!
@@ -129,7 +142,6 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         physicsWorld.gravity = .zero
         physicsWorld.contactDelegate = self
 
-        // Preload textures
         explosionFrames = SpriteFactory.explosionTextures()
         playerBulletTex = SpriteFactory.playerBulletTexture()
         enemyBulletTex = SpriteFactory.enemyBulletTexture()
@@ -261,6 +273,43 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         addChild(player)
     }
 
+    func enableDualFighter() {
+        guard !isDualFighter else { return }
+        isDualFighter = true
+
+        let tex = SpriteFactory.playerTexture()
+        let partner = SKSpriteNode(texture: tex)
+        partner.zPosition = 10
+        partner.position = CGPoint(x: player.position.x + dualOffset * 2, y: player.position.y)
+        addChild(partner)
+        dualPartner = partner
+
+        // Widen player hitbox
+        player.physicsBody = SKPhysicsBody(rectangleOf: CGSize(width: 22 + dualOffset * 2, height: 16))
+        player.physicsBody?.categoryBitMask = PhysicsCategory.player
+        player.physicsBody?.contactTestBitMask = PhysicsCategory.enemy | PhysicsCategory.enemyBullet
+        player.physicsBody?.collisionBitMask = PhysicsCategory.none
+        player.physicsBody?.isDynamic = true
+    }
+
+    func disableDualFighter() {
+        guard isDualFighter else { return }
+        isDualFighter = false
+
+        if let partner = dualPartner {
+            showExplosion(at: partner.position)
+            partner.removeFromParent()
+        }
+        dualPartner = nil
+
+        // Restore normal hitbox
+        player.physicsBody = SKPhysicsBody(rectangleOf: CGSize(width: 22, height: 16))
+        player.physicsBody?.categoryBitMask = PhysicsCategory.player
+        player.physicsBody?.contactTestBitMask = PhysicsCategory.enemy | PhysicsCategory.enemyBullet
+        player.physicsBody?.collisionBitMask = PhysicsCategory.none
+        player.physicsBody?.isDynamic = true
+    }
+
     // MARK: - Formation
 
     func setupFormation() {
@@ -331,14 +380,8 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         guard !event.isARepeat else { return }
         keysPressed.insert(event.keyCode)
 
-        if event.keyCode == 49 { // Space
-            handleFireOrStart()
-        }
-
-        // F key (keyCode 3) toggles fullscreen
-        if event.keyCode == 3 {
-            view?.window?.toggleFullScreen(nil)
-        }
+        if event.keyCode == 49 { handleFireOrStart() }
+        if event.keyCode == 3 { view?.window?.toggleFullScreen(nil) }
     }
 
     override func keyUp(with event: NSEvent) {
@@ -361,70 +404,38 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
 
     func setupGamepad() {
         NotificationCenter.default.addObserver(
-            forName: .GCControllerDidConnect,
-            object: nil, queue: .main
+            forName: .GCControllerDidConnect, object: nil, queue: .main
         ) { [weak self] note in
-            if let controller = note.object as? GCController {
-                self?.configureController(controller)
-            }
+            if let c = note.object as? GCController { self?.configureController(c) }
         }
-
-        // Configure any already-connected controllers
-        for controller in GCController.controllers() {
-            configureController(controller)
-        }
-
+        for c in GCController.controllers() { configureController(c) }
         GCController.startWirelessControllerDiscovery()
     }
 
     func configureController(_ controller: GCController) {
-        if let gp = controller.extendedGamepad {
-            configureExtendedGamepad(gp)
-        } else if let gp = controller.microGamepad {
-            configureMicroGamepad(gp)
-        }
+        if let gp = controller.extendedGamepad { configureExtendedGamepad(gp) }
+        else if let gp = controller.microGamepad { configureMicroGamepad(gp) }
     }
 
     func configureExtendedGamepad(_ gp: GCExtendedGamepad) {
-        // D-pad left/right
-        gp.dpad.left.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.keysPressed.insert(123) }
-            else       { self?.keysPressed.remove(123) }
+        gp.dpad.left.pressedChangedHandler = { [weak self] _, _, p in
+            if p { self?.keysPressed.insert(123) } else { self?.keysPressed.remove(123) }
         }
-        gp.dpad.right.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.keysPressed.insert(124) }
-            else       { self?.keysPressed.remove(124) }
+        gp.dpad.right.pressedChangedHandler = { [weak self] _, _, p in
+            if p { self?.keysPressed.insert(124) } else { self?.keysPressed.remove(124) }
         }
-
-        // Left thumbstick (analog)
-        gp.leftThumbstick.xAxis.valueChangedHandler = { [weak self] _, value in
-            self?.gamepadStickX = CGFloat(value)
+        gp.leftThumbstick.xAxis.valueChangedHandler = { [weak self] _, v in
+            self?.gamepadStickX = CGFloat(v)
         }
-
-        // Fire buttons (A / B / right trigger)
-        gp.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.handleFireOrStart() }
-        }
-        gp.buttonB.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.handleFireOrStart() }
-        }
-        gp.rightTrigger.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.handleFireOrStart() }
-        }
-
-        // Menu/Start button
-        gp.buttonMenu.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.handleFireOrStart() }
-        }
+        gp.buttonA.pressedChangedHandler = { [weak self] _, _, p in if p { self?.handleFireOrStart() } }
+        gp.buttonB.pressedChangedHandler = { [weak self] _, _, p in if p { self?.handleFireOrStart() } }
+        gp.rightTrigger.pressedChangedHandler = { [weak self] _, _, p in if p { self?.handleFireOrStart() } }
+        gp.buttonMenu.pressedChangedHandler = { [weak self] _, _, p in if p { self?.handleFireOrStart() } }
     }
 
     func configureMicroGamepad(_ gp: GCMicroGamepad) {
-        gp.dpad.xAxis.valueChangedHandler = { [weak self] _, value in
-            self?.gamepadStickX = CGFloat(value)
-        }
-        gp.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
-            if pressed { self?.handleFireOrStart() }
-        }
+        gp.dpad.xAxis.valueChangedHandler = { [weak self] _, v in self?.gamepadStickX = CGFloat(v) }
+        gp.buttonA.pressedChangedHandler = { [weak self] _, _, p in if p { self?.handleFireOrStart() } }
     }
 
     // MARK: - Shooting
@@ -432,10 +443,23 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     func firePlayerBullet() {
         guard playerBulletsOnScreen < maxPlayerBullets,
               fireCooldown <= 0,
-              !isPlayerDead, !isGameOver else { return }
+              !isPlayerDead, !isBeingCaptured, !isGameOver else { return }
 
+        // Fire from main ship
+        spawnBullet(at: CGPoint(x: player.position.x, y: player.position.y + 18))
+
+        // Fire from dual partner too
+        if isDualFighter, let partner = dualPartner {
+            spawnBullet(at: CGPoint(x: partner.position.x, y: partner.position.y + 18))
+        }
+
+        fireCooldown = fireCooldownTime
+        sound.playShoot()
+    }
+
+    func spawnBullet(at position: CGPoint) {
         let bullet = SKSpriteNode(texture: playerBulletTex)
-        bullet.position = CGPoint(x: player.position.x, y: player.position.y + 18)
+        bullet.position = position
         bullet.zPosition = 8
         bullet.name = "playerBullet"
 
@@ -447,8 +471,6 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
 
         addChild(bullet)
         playerBulletsOnScreen += 1
-        fireCooldown = fireCooldownTime
-        sound.playShoot()
 
         let dist = sceneH - bullet.position.y + 10
         let duration = TimeInterval(dist / playerBulletSpeed)
@@ -463,7 +485,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     }
 
     func fireEnemyBullet(from position: CGPoint) {
-        guard !isPlayerDead else { return }
+        guard !isPlayerDead, !isBeingCaptured else { return }
 
         let bullet = SKSpriteNode(texture: enemyBulletTex)
         bullet.position = position
@@ -478,7 +500,6 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
 
         addChild(bullet)
 
-        // Aim at player with some spread
         let dx = player.position.x - position.x
         let dy = player.position.y - position.y
         let dist = sqrt(dx * dx + dy * dy)
@@ -515,6 +536,14 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     }
 
     func startFlagshipDive(_ flagship: EnemyNode) {
+        // 30% chance of tractor beam dive if: no captured ship yet, not dual fighter,
+        // player has lives to spare, and we're past wave 1
+        let canCapture = capturingFlagship == nil && !isDualFighter && lives > 1
+        if canCapture {
+            startTractorBeamDive(flagship)
+            return
+        }
+
         let escorts = enemies.filter {
             $0.enemyType == .escort && !$0.isDiving && !$0.isReturning &&
             abs($0.gridCol - flagship.gridCol) <= 2
@@ -526,9 +555,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
             let delay = 0.25 * Double(i + 1)
             run(SKAction.sequence([
                 SKAction.wait(forDuration: delay),
-                SKAction.run { [weak self] in
-                    self?.startSoloDive(escort)
-                }
+                SKAction.run { [weak self] in self?.startSoloDive(escort) }
             ]))
         }
     }
@@ -578,13 +605,9 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
             }
         ])
 
-        let diveGroup = SKAction.group([followPath, fireSequence])
-
         enemy.run(SKAction.sequence([
-            diveGroup,
-            SKAction.run { [weak self] in
-                self?.enemyFinishedDive(enemy)
-            }
+            SKAction.group([followPath, fireSequence]),
+            SKAction.run { [weak self] in self?.enemyFinishedDive(enemy) }
         ]), withKey: "dive")
     }
 
@@ -611,6 +634,194 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
                 }
             }
         ]), withKey: "return")
+    }
+
+    // MARK: - Tractor Beam & Capture
+
+    func startTractorBeamDive(_ flagship: EnemyNode) {
+        flagship.isDiving = true
+        flagship.removeAction(forKey: "wingFlap")
+        sound.playDive()
+
+        let start = flagship.position
+        let hoverX = player.position.x + CGFloat.random(in: -30...30)
+        let hoverY: CGFloat = 160
+
+        // Dive to hover position above player
+        let path = CGMutablePath()
+        path.move(to: start)
+        path.addQuadCurve(
+            to: CGPoint(x: hoverX, y: hoverY),
+            control: CGPoint(x: start.x, y: 300)
+        )
+
+        let duration: TimeInterval = 1.2
+
+        flagship.run(SKAction.sequence([
+            SKAction.follow(path, asOffset: false, orientToPath: false, duration: duration),
+            SKAction.run { [weak self] in
+                self?.activateTractorBeam(from: flagship)
+            }
+        ]), withKey: "dive")
+    }
+
+    func activateTractorBeam(from flagship: EnemyNode) {
+        guard !isPlayerDead, !isGameOver, !isBeingCaptured else {
+            enemyFinishedDive(flagship)
+            return
+        }
+
+        tractorBeamFlagship = flagship
+        sound.playTractorBeam()
+
+        // Create beam visual - expanding horizontal lines
+        let beam = SKNode()
+        beam.name = "tractorBeam"
+        beam.zPosition = 15
+        for i in 0..<10 {
+            let y = -CGFloat(i) * 12 - 12
+            let width: CGFloat = 8 + CGFloat(i) * 6
+            let line = SKShapeNode(rectOf: CGSize(width: width, height: 2))
+            line.fillColor = NSColor(red: 0.3, green: 0.6, blue: 1.0, alpha: 0.8)
+            line.strokeColor = .clear
+            line.position = CGPoint(x: 0, y: y)
+            beam.addChild(line)
+        }
+        // Add a glow overlay
+        let glow = SKShapeNode(rectOf: CGSize(width: 12, height: 120))
+        glow.fillColor = NSColor(red: 0.5, green: 0.8, blue: 1.0, alpha: 0.15)
+        glow.strokeColor = .clear
+        glow.position = CGPoint(x: 0, y: -65)
+        beam.addChild(glow)
+
+        beam.position = CGPoint(x: flagship.position.x, y: flagship.position.y)
+        addChild(beam)
+        tractorBeamNode = beam
+
+        // Pulse the beam
+        let pulse = SKAction.sequence([
+            SKAction.fadeAlpha(to: 0.4, duration: 0.12),
+            SKAction.fadeAlpha(to: 1.0, duration: 0.12)
+        ])
+        beam.run(SKAction.repeatForever(pulse), withKey: "pulse")
+
+        // Beam lasts 2 seconds, then flagship retreats
+        flagship.run(SKAction.sequence([
+            SKAction.wait(forDuration: 2.0),
+            SKAction.run { [weak self] in
+                self?.deactivateTractorBeam()
+                if self?.isBeingCaptured == false {
+                    self?.enemyFinishedDive(flagship)
+                }
+            }
+        ]), withKey: "beamTimer")
+    }
+
+    func deactivateTractorBeam() {
+        tractorBeamFlagship = nil
+        tractorBeamNode?.removeAllActions()
+        tractorBeamNode?.removeFromParent()
+        tractorBeamNode = nil
+    }
+
+    func checkTractorBeamCapture() {
+        guard let flagship = tractorBeamFlagship, !isBeingCaptured, !isPlayerDead else { return }
+
+        let beamX = flagship.position.x
+        let beamWidth: CGFloat = 50
+        let playerX = player.position.x
+
+        if abs(playerX - beamX) < beamWidth / 2 {
+            capturePlayerShip(by: flagship)
+        }
+    }
+
+    func capturePlayerShip(by flagship: EnemyNode) {
+        isBeingCaptured = true
+        sound.playCapture()
+
+        // Cancel beam timer
+        flagship.removeAction(forKey: "beamTimer")
+
+        // If dual fighter, lose the partner instead of the main ship
+        if isDualFighter {
+            disableDualFighter()
+            isBeingCaptured = false
+            deactivateTractorBeam()
+            enemyFinishedDive(flagship)
+            return
+        }
+
+        // Animate player floating up into the beam
+        let targetY = flagship.position.y - 20
+        player.run(SKAction.sequence([
+            SKAction.move(to: CGPoint(x: flagship.position.x, y: targetY), duration: 1.0),
+            SKAction.run { [weak self] in
+                guard let self = self else { return }
+
+                // Hide original player
+                self.player.isHidden = true
+
+                // Create captured ship node that will sit in formation
+                let capturedShip = SKSpriteNode(texture: SpriteFactory.playerTexture())
+                capturedShip.zPosition = 6
+                capturedShip.name = "capturedShip"
+                // Position it relative to flagship's formation offset
+                capturedShip.position = flagship.position
+                self.addChild(capturedShip)
+                self.capturedShipNode = capturedShip
+                self.capturingFlagship = flagship
+                flagship.hasCapturedShip = true
+
+                self.deactivateTractorBeam()
+
+                // Flagship returns to formation carrying the captured ship
+                self.isBeingCaptured = false
+                self.enemyFinishedDive(flagship)
+
+                // Lose a life
+                self.lives -= 1
+                self.updateLivesDisplay()
+                self.isPlayerDead = true
+
+                if self.lives <= 0 {
+                    self.gameOver()
+                } else {
+                    self.respawnTimer = 2.0
+                }
+            }
+        ]))
+    }
+
+    func releaseCapturedShip() {
+        guard let capturedShip = capturedShipNode else { return }
+
+        capturingFlagship?.hasCapturedShip = false
+        capturingFlagship = nil
+
+        sound.playRescue()
+
+        // Animate captured ship flying down to dock with player
+        let targetX = player.position.x + dualOffset
+        let targetY = player.position.y
+
+        capturedShip.run(SKAction.sequence([
+            // Little spin
+            SKAction.group([
+                SKAction.rotate(byAngle: .pi * 4, duration: 0.8),
+                SKAction.move(to: CGPoint(x: targetX, y: targetY + 80), duration: 0.8)
+            ]),
+            // Dock with player
+            SKAction.group([
+                SKAction.rotate(toAngle: 0, duration: 0.4),
+                SKAction.move(to: CGPoint(x: targetX, y: targetY), duration: 0.4)
+            ]),
+            SKAction.run { [weak self] in
+                capturedShip.removeFromParent()
+                self?.capturedShipNode = nil
+                self?.enableDualFighter()
+            }
+        ]))
     }
 
     // MARK: - Collisions
@@ -667,13 +878,39 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         showExplosion(at: enemy.position)
         sound.playEnemyHit()
 
+        // Check if this flagship had a captured ship
+        let hadCapturedShip = enemy.hasCapturedShip && capturingFlagship === enemy
+
         enemy.removeAllActions()
         enemy.removeFromParent()
         enemies.removeAll { $0 === enemy }
+
+        // If this was the tractor beam flagship, cancel the beam
+        if tractorBeamFlagship === enemy {
+            deactivateTractorBeam()
+        }
+
+        // Release captured ship if this flagship held it
+        if hadCapturedShip && !isPlayerDead {
+            releaseCapturedShip()
+        } else if hadCapturedShip && isPlayerDead {
+            // Ship is lost - remove the captured ship node
+            capturedShipNode?.removeFromParent()
+            capturedShipNode = nil
+            capturingFlagship = nil
+        }
     }
 
     func handlePlayerHit() {
-        guard !isPlayerDead, !isGameOver else { return }
+        guard !isPlayerDead, !isGameOver, !isBeingCaptured else { return }
+
+        // If dual fighter, lose the partner instead of dying
+        if isDualFighter {
+            disableDualFighter()
+            sound.playEnemyHit()
+            return
+        }
+
         isPlayerDead = true
 
         showExplosion(at: player.position)
@@ -749,6 +986,13 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         enumerateChildNodes(withName: "playerBullet") { node, _ in node.removeFromParent() }
         playerBulletsOnScreen = 0
 
+        // If captured ship's flagship was cleared with the wave, the ship is lost
+        if let cap = capturingFlagship, !enemies.contains(where: { $0 === cap }) {
+            capturedShipNode?.removeFromParent()
+            capturedShipNode = nil
+            capturingFlagship = nil
+        }
+
         run(SKAction.sequence([
             SKAction.wait(forDuration: 2.0),
             SKAction.run { [weak self] in
@@ -764,6 +1008,7 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     func gameOver() {
         isGameOver = true
         removeAction(forKey: "diveTimer")
+        deactivateTractorBeam()
 
         let label = makeLabel("GAME OVER", size: 28, color: .red)
         label.position = CGPoint(x: sceneW / 2, y: sceneH / 2 + 20)
@@ -793,9 +1038,16 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         gameOverLabel = nil
         startLabel = nil
         gamepadStickX = 0
+        isDualFighter = false
+        dualPartner = nil
+        capturedShipNode = nil
+        capturingFlagship = nil
+        isBeingCaptured = false
+        tractorBeamFlagship = nil
+        tractorBeamNode = nil
 
         score = 0
-        lives = 3
+        lives = 6
         wave = 1
         isGameOver = false
         isPlayerDead = false
@@ -823,6 +1075,9 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
 
         guard !isGameOver, startLabel == nil else { return }
 
+        // Check tractor beam capture
+        checkTractorBeamCapture()
+
         if isPlayerDead {
             respawnTimer -= dt
             if respawnTimer <= 0 {
@@ -832,6 +1087,8 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
             }
             return
         }
+
+        if isBeingCaptured { return }
 
         if fireCooldown > 0 { fireCooldown -= dt }
         updatePlayerMovement(CGFloat(dt))
@@ -862,22 +1119,23 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
     func updatePlayerMovement(_ dt: CGFloat) {
         var moveX: CGFloat = 0
 
-        // Keyboard
         if keysPressed.contains(123) { moveX -= 1 }
         if keysPressed.contains(124) { moveX += 1 }
-
-        // Analog stick (with deadzone)
-        if abs(gamepadStickX) > 0.15 {
-            moveX += gamepadStickX
-        }
-
-        // Clamp combined input
+        if abs(gamepadStickX) > 0.15 { moveX += gamepadStickX }
         moveX = max(-1, min(1, moveX))
 
         player.position.x += moveX * playerSpeed * dt
 
-        let halfW: CGFloat = 16
+        let halfW: CGFloat = isDualFighter ? 16 + dualOffset : 16
         player.position.x = max(halfW, min(sceneW - halfW, player.position.x))
+
+        // Keep dual partner in sync
+        if let partner = dualPartner {
+            partner.position = CGPoint(
+                x: player.position.x + dualOffset * 2,
+                y: player.position.y
+            )
+        }
     }
 
     func updateFormation(_ dt: CGFloat) {
@@ -907,6 +1165,20 @@ class GameScene: SKScene, SKPhysicsContactDelegate {
         for enemy in enemies where !enemy.isDiving && !enemy.isReturning {
             enemy.position.x = formationX + enemy.formationOffset.x
             enemy.position.y = formationBaseY + enemy.formationOffset.y
+        }
+
+        // Keep captured ship next to its flagship in formation
+        if let ship = capturedShipNode, let flagship = capturingFlagship,
+           !flagship.isDiving, !flagship.isReturning {
+            ship.position = CGPoint(
+                x: flagship.position.x + gridSpacingX * 0.6,
+                y: flagship.position.y
+            )
+        }
+
+        // Move beam visual with flagship during beam
+        if let beam = tractorBeamNode, let flagship = tractorBeamFlagship {
+            beam.position = CGPoint(x: flagship.position.x, y: flagship.position.y)
         }
     }
 }

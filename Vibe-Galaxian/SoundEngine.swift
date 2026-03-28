@@ -17,6 +17,9 @@ class SoundEngine {
     private var bonusBuffer: AVAudioPCMBuffer!
     private var waveClearBuffer: AVAudioPCMBuffer!
     private var startBuffer: AVAudioPCMBuffer!
+    private var tractorBeamBuffer: AVAudioPCMBuffer!
+    private var captureBuffer: AVAudioPCMBuffer!
+    private var rescueBuffer: AVAudioPCMBuffer!
 
     private init() {
         format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
@@ -50,6 +53,9 @@ class SoundEngine {
     func playBonus()        { play(bonusBuffer) }
     func playWaveClear()    { play(waveClearBuffer) }
     func playStart()        { play(startBuffer) }
+    func playTractorBeam()  { play(tractorBeamBuffer) }
+    func playCapture()      { play(captureBuffer) }
+    func playRescue()       { play(rescueBuffer) }
 
     // MARK: - Playback
 
@@ -117,6 +123,32 @@ class SoundEngine {
         startBuffer = makeBuffer(duration: 0.15) { t, p in
             let freq: Float = 400 + 800 * p
             let amp: Float = 0.18 * (1 - p * 0.5)
+            return amp * sin(2 * .pi * freq * t)
+        }
+
+        // Tractor beam – warbling sustained tone
+        tractorBeamBuffer = makeBuffer(duration: 1.2) { t, p in
+            let wobble = sin(2 * .pi * 6 * t)  // 6 Hz wobble
+            let freq: Float = 180 + 40 * wobble
+            let amp: Float = 0.18
+            return amp * sin(2 * .pi * freq * t)
+        }
+
+        // Capture – descending ominous sweep
+        captureBuffer = makeBuffer(duration: 0.6) { t, p in
+            let freq: Float = 600 - 400 * p
+            let amp: Float = 0.25 * (1 - p * 0.3)
+            let square: Float = sin(2 * .pi * freq * t) > 0 ? 1 : -1
+            return amp * square * 0.5 + amp * sin(2 * .pi * freq * 0.5 * t) * 0.5
+        }
+
+        // Rescue – triumphant ascending sweep
+        rescueBuffer = makeBuffer(duration: 0.4) { t, p in
+            let freq: Float
+            if p < 0.33      { freq = 440 }
+            else if p < 0.66 { freq = 660 }
+            else              { freq = 880 }
+            let amp: Float = 0.22 * (1 - p * 0.3)
             return amp * sin(2 * .pi * freq * t)
         }
     }
